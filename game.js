@@ -1,0 +1,1201 @@
+/**
+ * Pink Planet: Tech Crush - Core Match-3 Game Engine
+ */
+
+class TechCrushGame {
+  constructor() {
+    this.rows = 8;
+    this.cols = 8;
+    this.grid = []; // 2D array [row][col]
+    this.selectedTile = null; // { r, c }
+    this.dragStart = null; // { r, c, startX, startY, hasMoved }
+    this.isAnimating = false;
+    this.currentLevel = null;
+    this.score = 0;
+    this.movesLeft = 0;
+    this.combo = 1;
+    this.collectedTargets = {};
+    this.bossHp = 0;
+    this.maxBossHp = 100;
+
+    // Saved state
+    this.highestLevel = this.loadHighestLevel();
+    this.levelStars = this.loadLevelStars();
+
+    // Elements
+    this.boardEl = document.getElementById('game-board');
+    this.canvas = document.getElementById('fx-canvas');
+    this.ctx = this.canvas ? this.canvas.getContext('2d') : null;
+    this.particles = [];
+
+    this.initCanvas();
+    window.addEventListener('resize', () => this.initCanvas());
+
+    // Global drag handlers to ensure drag never drops outside tile boundaries
+    window.addEventListener('pointermove', (e) => this.handleGlobalPointerMove(e));
+    window.addEventListener('pointerup', (e) => this.handleGlobalPointerUp(e));
+    window.addEventListener('pointercancel', (e) => this.handleGlobalPointerCancel(e));
+
+    this.renderLoop = this.renderLoop.bind(this);
+    requestAnimationFrame(this.renderLoop);
+  }
+  loadHighestLevel() {
+    try {
+      const saved = localStorage.getItem('pink_planet_highest_level');
+      return saved ? parseInt(saved, 10) : 1;
+    } catch (e) {
+      return 1;
+    }
+  }
+
+  saveHighestLevel(lvl) {
+    if (lvl > this.highestLevel) {
+      this.highestLevel = lvl;
+      try {
+        localStorage.setItem('pink_planet_highest_level', lvl.toString());
+      } catch (e) {}
+    }
+  }
+
+  loadLevelStars() {
+    try {
+      const saved = localStorage.getItem('pink_planet_level_stars');
+      return saved ? JSON.parse(saved) : {};
+    } catch (e) {
+      return {};
+    }
+  }
+
+  saveLevelStars(lvl, stars) {
+    const prev = this.levelStars[lvl] || 0;
+    if (stars > prev) {
+      this.levelStars[lvl] = stars;
+      try {
+        localStorage.setItem('pink_planet_level_stars', JSON.stringify(this.levelStars));
+      } catch (e) {}
+    }
+  }
+
+  initCanvas() {
+    if (!this.canvas) return;
+    const rect = this.boardEl.getBoundingClientRect();
+    this.canvas.width = rect.width;
+    this.canvas.height = rect.height;
+  }
+
+  // Start a given level
+  startLevel(levelId) {
+    const lvlConfig = GAME_LEVELS.find(l => l.id === levelId);
+    if (!lvlConfig) return;
+
+    this.currentLevel = lvlConfig;
+    this.score = 0;
+    this.combo = 1;
+
+    // PC Builder passive perks
+    const perks = pcBuilder.getActivePerks();
+
+    let extraMoves = perks.extraMoves;
+    if (lvlConfig.type === 'boss') {
+      extraMoves += perks.bossExtraMoves;
+      this.bossHp = lvlConfig.bossHp;
+      this.maxBossHp = lvlConfig.bossHp;
+    }
+
+    this.movesLeft = lvlConfig.moves + extraMoves;
+
+    // Initialize Targets
+    this.collectedTargets = {};
+    if (lvlConfig.targets) {
+      Object.keys(lvlConfig.targets).forEach(k => {
+        this.collectedTargets[k] = 0;
+      });
+    }
+
+    // Generate initial grid with no matches
+    this.generateBoard(lvlConfig);
+
+    // Apply start-of-level perks
+    if (perks.startCpuBurst > 0) {
+      this.spawnSpecialTile('cpu_burst_h');
+    }
+    if (perks.startGpuLaser > 0) {
+      this.spawnSpecialTile('gpu_laser');
+    }
+    if (perks.startCleanseVirus > 0 && lvlConfig.type === 'virus_clear') {
+      this.cleanseVirusTiles(perks.startCleanseVirus);
+    }
+
+    this.updateUI();
+    this.renderBoard();
+  }
+
+  generateBoard(lvlConfig) {
+    const allowed = lvlConfig.allowedComponents;
+    this.grid = [];
+
+    for (let r = 0; r < this.rows; r++) {
+      this.grid[r] = [];
+      for (let c = 0; c < this.cols; c++) {
+        let type;
+        do {
+          type = allowed[Math.floor(Math.random() * allowed.length)];
+        } while (
+          (c >= 2 && this.grid[r][c - 1]?.type === type && this.grid[r][c - 2]?.type === type) ||
+          (r >= 2 && this.grid[r - 1][c]?.type === type && this.grid[r - 2][c]?.type === type)
+        );
+
+        this.grid[r][c] = {
+          type: type,
+          special: null, // 'cpu_burst_h', 'cpu_burst_v', 'gpu_laser', 'fan_bomb'
+          isVirus: false,
+          id: `tile_${r}_${c}_${Math.random()}`
+        };
+      }
+    }
+
+    // Inject virus corruption tiles for virus_clear levels
+    if (lvlConfig.type === 'virus_clear' && lvlConfig.virusTilesCount) {
+      let count = 0;
+      while (count < lvlConfig.virusTilesCount) {
+        const rr = Math.floor(Math.random() * this.rows);
+        const rc = Math.floor(Math.random() * this.cols);
+        if (!this.grid[rr][rc].isVirus) {
+          this.grid[rr][rc].isVirus = true;
+          count++;
+        }
+      }
+    }
+  }
+
+  spawnSpecialTile(specialType) {
+    const rr = Math.floor(Math.random() * (this.rows - 2)) + 1;
+    const rc = Math.floor(Math.random() * (this.cols - 2)) + 1;
+    this.grid[rr][rc].special = specialType;
+  }
+
+  cleanseVirusTiles(numToCleanse) {
+    let cleansed = 0;
+    for (let r = 0; r < this.rows; r++) {
+      for (let c = 0; c < this.cols; c++) {
+        if (this.grid[r][c].isVirus && cleansed < numToCleanse) {
+          this.grid[r][c].isVirus = false;
+          cleansed++;
+        }
+      }
+    }
+  }
+
+  // Helper to find a tile DOM element by row and column
+  getTileEl(r, c) {
+    if (!this.boardEl) return null;
+    return this.boardEl.querySelector(`.tile[data-row="${r}"][data-col="${c}"]`);
+  }
+
+  // Update selection visually without full re-render
+  updateTileSelection() {
+    if (!this.boardEl) return;
+    const tiles = this.boardEl.querySelectorAll('.tile');
+    tiles.forEach(el => {
+      const r = parseInt(el.dataset.row, 10);
+      const c = parseInt(el.dataset.col, 10);
+      if (this.selectedTile && this.selectedTile.r === r && this.selectedTile.c === c) {
+        el.classList.add('selected');
+      } else {
+        el.classList.remove('selected');
+      }
+    });
+  }
+
+  // Render HTML DOM Board
+  renderBoard(newSpawnCoords = []) {
+    if (!this.boardEl) return;
+    this.boardEl.innerHTML = '';
+
+    for (let r = 0; r < this.rows; r++) {
+      for (let c = 0; c < this.cols; c++) {
+        const tile = this.grid[r][c];
+        const tileEl = document.createElement('div');
+
+        if (!tile) {
+          tileEl.className = 'tile empty-tile';
+          tileEl.dataset.row = r;
+          tileEl.dataset.col = c;
+          this.boardEl.appendChild(tileEl);
+          continue;
+        }
+
+        const isNewSpawn = newSpawnCoords.some(coord => coord.r === r && coord.c === c);
+        tileEl.className = `tile type-${tile.type}${isNewSpawn ? ' tile-spawn-in' : ''}`;
+        if (tile.special) tileEl.classList.add(`special-${tile.special}`);
+        if (tile.isVirus) tileEl.classList.add('virus-corrupted');
+
+        if (this.selectedTile && this.selectedTile.r === r && this.selectedTile.c === c) {
+          tileEl.classList.add('selected');
+        }
+
+        tileEl.dataset.row = r;
+        tileEl.dataset.col = c;
+
+        // Render component Icon SVG / Graphic
+        const comp = COMPONENT_TYPES[tile.type.toUpperCase()] || { name: tile.type, color: '#fff' };
+        tileEl.style.setProperty('--tile-color', comp.color);
+        tileEl.innerHTML = this.getComponentSVG(tile.type, tile.special, tile.isVirus);
+
+        // Interaction Handlers (Pointer Drag & Click)
+        tileEl.addEventListener('pointerdown', (e) => this.handlePointerDown(e, r, c));
+        tileEl.addEventListener('click', (e) => this.handleTileClick(r, c));
+
+        this.boardEl.appendChild(tileEl);
+      }
+    }
+  }
+
+  // Pointer Down: Start drag or prepare click
+  handlePointerDown(e, r, c) {
+    if (this.isAnimating) return;
+    this.dragStart = {
+      r,
+      c,
+      startX: e.clientX,
+      startY: e.clientY,
+      hasMoved: false
+    };
+  }
+
+  // Global Pointer Move: Trigger directional swap as soon as user drags 16px
+  handleGlobalPointerMove(e) {
+    if (!this.dragStart || this.isAnimating || this.dragStart.hasMoved) return;
+
+    const dx = e.clientX - this.dragStart.startX;
+    const dy = e.clientY - this.dragStart.startY;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+
+    if (Math.max(absDx, absDy) > 16) {
+      this.dragStart.hasMoved = true;
+      const startR = this.dragStart.r;
+      const startC = this.dragStart.c;
+
+      let targetR = startR;
+      let targetC = startC;
+
+      if (absDx > absDy) {
+        targetC += (dx > 0) ? 1 : -1;
+      } else {
+        targetR += (dy > 0) ? 1 : -1;
+      }
+
+      this.selectedTile = null;
+      this.updateTileSelection();
+
+      if (targetR >= 0 && targetR < this.rows && targetC >= 0 && targetC < this.cols) {
+        this.attemptSwap(startR, startC, targetR, targetC);
+      }
+      this.dragStart = null;
+    }
+  }
+
+  // Global Pointer Up
+  handleGlobalPointerUp(e) {
+    this.dragStart = null;
+  }
+
+  handleGlobalPointerCancel(e) {
+    this.dragStart = null;
+  }
+
+  // Tile Click / Selection Handler
+  handleTileClick(r, c) {
+    if (this.isAnimating) return;
+    soundManager.playClick();
+
+    if (!this.selectedTile) {
+      // First tile clicked: Select it!
+      this.selectedTile = { r, c };
+      this.updateTileSelection();
+    } else {
+      const prev = this.selectedTile;
+
+      // Clicked same tile: Deselect!
+      if (prev.r === r && prev.c === c) {
+        this.selectedTile = null;
+        this.updateTileSelection();
+        return;
+      }
+
+      // Check if adjacent: |r1 - r2| + |c1 - c2| === 1
+      const dist = Math.abs(prev.r - r) + Math.abs(prev.c - c);
+      if (dist === 1) {
+        this.selectedTile = null;
+        this.updateTileSelection();
+        this.attemptSwap(prev.r, prev.c, r, c);
+      } else {
+        // Not adjacent: Switch selection to the new tile
+        this.selectedTile = { r, c };
+        this.updateTileSelection();
+      }
+    }
+  }
+
+  getComponentSVG(type, special, isVirus) {
+    if (isVirus) {
+      return `
+        <svg viewBox="0 0 64 64" class="comp-icon virus-icon">
+          <polygon points="32,4 58,18 58,46 32,60 6,46 6,18" fill="#ff0044" opacity="0.2"/>
+          <path d="M20 20 L44 44 M44 20 L20 44" stroke="#ff0055" stroke-width="6" stroke-linecap="round"/>
+          <circle cx="32" cy="32" r="12" fill="#990022" />
+          <text x="32" y="37" font-size="14" font-weight="bold" fill="#ffffff" text-anchor="middle">👾</text>
+        </svg>
+      `;
+    }
+
+    let badge = '';
+    if (special === 'cpu_burst_h') badge = `<div class="special-badge burst-h">⚡</div>`;
+    if (special === 'cpu_burst_v') badge = `<div class="special-badge burst-v">⚡</div>`;
+    if (special === 'gpu_laser') badge = `<div class="special-badge laser">🌈</div>`;
+    if (special === 'fan_bomb') badge = `<div class="special-badge bomb">💥</div>`;
+
+    let iconSvg = '';
+    switch (type) {
+      case 'cpu':
+        iconSvg = `
+          <svg viewBox="0 0 64 64" class="comp-icon">
+            <rect x="12" y="12" width="40" height="40" rx="8" fill="url(#cpuGrad)" stroke="#ff66aa" stroke-width="2"/>
+            <rect x="22" y="22" width="20" height="20" rx="4" fill="#110515" stroke="#ff2a85" stroke-width="2"/>
+            <path d="M12 20 H6 M12 32 H6 M12 44 H6 M52 20 H58 M52 32 H58 M52 44 H58 M20 12 V6 M32 12 V6 M44 12 V6 M20 52 V58 M32 52 V58 M44 52 V58" stroke="#ff80bb" stroke-width="2.5" stroke-linecap="round"/>
+            <defs>
+              <linearGradient id="cpuGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#ff2a85"/>
+                <stop offset="100%" stop-color="#800040"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        `;
+        break;
+      case 'ram':
+        iconSvg = `
+          <svg viewBox="0 0 64 64" class="comp-icon">
+            <rect x="8" y="18" width="48" height="28" rx="4" fill="url(#ramGrad)" stroke="#00f0ff" stroke-width="2"/>
+            <rect x="14" y="24" width="8" height="12" fill="#052028"/>
+            <rect x="24" y="24" width="8" height="12" fill="#052028"/>
+            <rect x="34" y="24" width="8" height="12" fill="#052028"/>
+            <rect x="44" y="24" width="8" height="12" fill="#052028"/>
+            <path d="M12 46 V50 M20 46 V50 M28 46 V50 M36 46 V50 M44 46 V50 M52 46 V50" stroke="#ffea00" stroke-width="3"/>
+            <defs>
+              <linearGradient id="ramGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#00f0ff"/>
+                <stop offset="100%" stop-color="#005080"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        `;
+        break;
+      case 'gpu':
+        iconSvg = `
+          <svg viewBox="0 0 64 64" class="comp-icon">
+            <rect x="8" y="14" width="48" height="36" rx="6" fill="url(#gpuGrad)" stroke="#bd00ff" stroke-width="2"/>
+            <circle cx="22" cy="32" r="10" fill="#150025" stroke="#e066ff" stroke-width="2"/>
+            <circle cx="42" cy="32" r="10" fill="#150025" stroke="#e066ff" stroke-width="2"/>
+            <path d="M22 24 L22 40 M14 32 L30 32 M42 24 L42 40 M34 32 L50 32" stroke="#bd00ff" stroke-width="2"/>
+            <rect x="2" y="22" width="6" height="20" rx="1" fill="#aaaaaa"/>
+            <defs>
+              <linearGradient id="gpuGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#bd00ff"/>
+                <stop offset="100%" stop-color="#400060"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        `;
+        break;
+      case 'circuit':
+        iconSvg = `
+          <svg viewBox="0 0 64 64" class="comp-icon">
+            <rect x="10" y="10" width="44" height="44" rx="6" fill="url(#circGrad)" stroke="#00ff9d" stroke-width="2"/>
+            <circle cx="20" cy="20" r="4" fill="#00ff9d"/>
+            <circle cx="44" cy="44" r="4" fill="#00ff9d"/>
+            <path d="M20 20 L32 20 L32 36 L44 36 L44 44" stroke="#00ff9d" stroke-width="2.5" fill="none" stroke-linejoin="round"/>
+            <circle cx="44" cy="20" r="3" fill="#ffea00"/>
+            <path d="M44 20 L36 28 L20 28" stroke="#ffea00" stroke-width="2" fill="none"/>
+            <defs>
+              <linearGradient id="circGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#00aa66"/>
+                <stop offset="100%" stop-color="#003311"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        `;
+        break;
+      case 'fan':
+        iconSvg = `
+          <svg viewBox="0 0 64 64" class="comp-icon spin-fan">
+            <circle cx="32" cy="32" r="24" fill="url(#fanGrad)" stroke="#ff9900" stroke-width="2"/>
+            <circle cx="32" cy="32" r="6" fill="#ffffff"/>
+            <path d="M32 26 C26 16 38 12 32 6 C38 12 44 20 32 26 Z" fill="#ffea00"/>
+            <path d="M38 32 C48 26 52 38 58 32 C52 38 44 44 38 32 Z" fill="#ffaa00"/>
+            <path d="M32 38 C38 48 26 52 32 58 C26 52 20 44 32 38 Z" fill="#ff6600"/>
+            <path d="M26 32 C16 38 12 26 6 32 C12 26 20 20 26 32 Z" fill="#ff3300"/>
+            <defs>
+              <linearGradient id="fanGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#ff9900"/>
+                <stop offset="100%" stop-color="#662200"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        `;
+        break;
+      case 'ssd':
+        iconSvg = `
+          <svg viewBox="0 0 64 64" class="comp-icon">
+            <rect x="14" y="8" width="36" height="48" rx="4" fill="url(#ssdGrad)" stroke="#ffea00" stroke-width="2"/>
+            <rect x="20" y="16" width="24" height="14" rx="2" fill="#111"/>
+            <path d="M26 20 L32 26 L38 20" stroke="#ffea00" stroke-width="2" fill="none"/>
+            <rect x="20" y="34" width="24" height="14" rx="2" fill="#222"/>
+            <circle cx="32" cy="41" r="3" fill="#00ff9d"/>
+            <defs>
+              <linearGradient id="ssdGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#ffea00"/>
+                <stop offset="100%" stop-color="#887700"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        `;
+        break;
+    }
+
+    return badge + iconSvg;
+  }
+
+  // Unified Pointer & Drag / Click Interaction Handlers
+  handlePointerDown(e, r, c) {
+    if (this.isAnimating) return;
+    try {
+      e.target.setPointerCapture(e.pointerId);
+    } catch (err) {}
+    this.pointerState = {
+      r,
+      c,
+      startX: e.clientX,
+      startY: e.clientY,
+      hasMoved: false
+    };
+  }
+
+  handlePointerMove(e, r, c) {
+    if (!this.pointerState || this.isAnimating || this.pointerState.hasMoved) return;
+
+    const dx = e.clientX - this.pointerState.startX;
+    const dy = e.clientY - this.pointerState.startY;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+
+    // If dragged more than 16 pixels, perform an instant directional swap
+    if (Math.max(absDx, absDy) > 16) {
+      this.pointerState.hasMoved = true;
+      const startR = this.pointerState.r;
+      const startC = this.pointerState.c;
+
+      let targetR = startR;
+      let targetC = startC;
+
+      if (absDx > absDy) {
+        targetC += (dx > 0) ? 1 : -1;
+      } else {
+        targetR += (dy > 0) ? 1 : -1;
+      }
+
+      this.selectedTile = null;
+
+      if (targetR >= 0 && targetR < this.rows && targetC >= 0 && targetC < this.cols) {
+        this.attemptSwap(startR, startC, targetR, targetC);
+      } else {
+        this.renderBoard();
+      }
+    }
+  }
+
+  handlePointerUp(e, r, c) {
+    if (!this.pointerState) return;
+    try {
+      e.target.releasePointerCapture(e.pointerId);
+    } catch (err) {}
+
+    // If pointer was clicked without dragging, trigger click-to-swap
+    if (!this.pointerState.hasMoved && !this.isAnimating) {
+      this.handleTileClick(this.pointerState.r, this.pointerState.c);
+    }
+
+    this.pointerState = null;
+  }
+
+  handlePointerCancel(e) {
+    this.pointerState = null;
+  }
+
+  // Handle Tile Click / Selection
+  handleTileClick(r, c) {
+    if (this.isAnimating) return;
+    soundManager.playClick();
+
+    if (!this.selectedTile) {
+      this.selectedTile = { r, c };
+      this.renderBoard();
+    } else {
+      const prev = this.selectedTile;
+      this.selectedTile = null;
+
+      // Clicked the same tile -> Deselect
+      if (prev.r === r && prev.c === c) {
+        this.renderBoard();
+        return;
+      }
+
+      // Check if adjacent
+      const dist = Math.abs(prev.r - r) + Math.abs(prev.c - c);
+      if (dist === 1) {
+        this.attemptSwap(prev.r, prev.c, r, c);
+      } else {
+        // Select new tile
+        this.selectedTile = { r, c };
+        this.renderBoard();
+      }
+    }
+  }
+
+  // Fallback touch handlers for compatibility
+  handleTouchStart(e, r, c) {
+    if (this.isAnimating) return;
+    const touch = e.touches[0];
+    this.touchStartPoint = { r, c, x: touch.clientX, y: touch.clientY };
+  }
+
+  handleTouchEnd(e, r, c) {
+    if (!this.touchStartPoint || this.isAnimating) return;
+    const touch = e.changedTouches[0];
+    const dx = touch.clientX - this.touchStartPoint.x;
+    const dy = touch.clientY - this.touchStartPoint.y;
+    const absDx = Math.abs(dx);
+    const absDy = Math.abs(dy);
+
+    if (Math.max(absDx, absDy) > 20) {
+      let targetR = r;
+      let targetC = c;
+      if (absDx > absDy) {
+        targetC += (dx > 0) ? 1 : -1;
+      } else {
+        targetR += (dy > 0) ? 1 : -1;
+      }
+
+      if (targetR >= 0 && targetR < this.rows && targetC >= 0 && targetC < this.cols) {
+        this.selectedTile = null;
+        this.attemptSwap(r, c, targetR, targetC);
+      }
+    }
+    this.touchStartPoint = null;
+  }
+
+  // Attempt Swap logic with Guaranteed Smooth Visual Movement
+  async attemptSwap(r1, c1, r2, c2) {
+    if (this.isAnimating) return;
+    this.isAnimating = true;
+    this.selectedTile = null;
+    this.updateTileSelection();
+
+    try {
+      const tile1 = this.grid[r1][c1];
+      const tile2 = this.grid[r2][c2];
+
+      if (!tile1 || !tile2) {
+        this.isAnimating = false;
+        return;
+      }
+
+      const el1 = this.getTileEl(r1, c1);
+      const el2 = this.getTileEl(r2, c2);
+
+      soundManager.playSwap();
+
+      // 1. VISIBLE SLIDE ANIMATION: Move candies into each other's slots
+      if (el1 && el2) {
+        const stepX = (el1.offsetWidth || el1.clientWidth || 50) + 6;
+        const stepY = (el1.offsetHeight || el1.clientHeight || 50) + 6;
+        const dx = (c2 - c1) * stepX;
+        const dy = (r2 - r1) * stepY;
+
+        el1.style.transition = 'transform 0.24s cubic-bezier(0.25, 1, 0.5, 1)';
+        el2.style.transition = 'transform 0.24s cubic-bezier(0.25, 1, 0.5, 1)';
+        el1.style.zIndex = '20';
+        el2.style.zIndex = '20';
+
+        el1.style.transform = `translate(${dx}px, ${dy}px)`;
+        el2.style.transform = `translate(${-dx}px, ${-dy}px)`;
+
+        await this.delay(240);
+      }
+
+      // Check special interaction: GPU Laser Swap with any component!
+      const isLaserSwap = (tile1.special === 'gpu_laser') || (tile2.special === 'gpu_laser');
+
+      // Swap in memory
+      this.grid[r1][c1] = tile2;
+      this.grid[r2][c2] = tile1;
+
+      // 2. CHECK HORIZONTALLY AND VERTICALLY FOR 3 OR MORE MATCHING CANDIES
+      const matches = this.findMatches();
+      const hasMatch = matches.matchedCoords && matches.matchedCoords.length > 0;
+
+      if (hasMatch || isLaserSwap) {
+        // Swap created a match: Render in new positions and process!
+        this.renderBoard();
+        this.movesLeft--;
+        this.combo = 1;
+        this.updateUI();
+
+        if (isLaserSwap) {
+          const targetType = (tile1.special === 'gpu_laser') ? tile2.type : tile1.type;
+          soundManager.playGpuLaser();
+          this.spawnLaserBeamFX(r1, c1, r2, c2);
+          await this.clearAllOfComponentType(targetType);
+        } else {
+          await this.processMatches(matches);
+        }
+
+        // Boss Attack check
+        if (this.currentLevel.type === 'boss' && this.bossHp > 0 && this.movesLeft % 3 === 0) {
+          this.triggerBossAttack();
+        }
+
+        this.checkLevelStatus();
+      } else {
+        // 3. NO MATCH: MOVE CANDIES VISIBLY BACK TO ORIGINAL POSITIONS!
+        if (el1 && el2) {
+          el1.style.transform = 'translate(0px, 0px)';
+          el2.style.transform = 'translate(0px, 0px)';
+          await this.delay(240);
+        }
+
+        // Revert in memory
+        this.grid[r1][c1] = tile1;
+        this.grid[r2][c2] = tile2;
+        this.renderBoard();
+      }
+    } finally {
+      this.isAnimating = false;
+    }
+  }
+
+  // Clear all instances of a component type (GPU Laser Bomb)
+  async clearAllOfComponentType(type) {
+    let count = 0;
+    const toClear = [];
+    for (let r = 0; r < this.rows; r++) {
+      for (let c = 0; c < this.cols; c++) {
+        if (this.grid[r][c] && (this.grid[r][c].type === type || this.grid[r][c].special === 'gpu_laser')) {
+          toClear.push({ r, c });
+          count++;
+        }
+      }
+    }
+    this.addScore(count * 200, "GPU LASER SURGE!");
+    await this.destroyTiles(toClear);
+    await this.applyGravity();
+  }
+
+  // Find 3+ in a row or column matches
+  findMatches() {
+    const matchedTiles = new Set();
+    const matchGroups = [];
+
+    // Horizontal check
+    for (let r = 0; r < this.rows; r++) {
+      let matchLen = 1;
+      for (let c = 0; c < this.cols; c++) {
+        const current = this.grid[r][c];
+        const next = c < this.cols - 1 ? this.grid[r][c + 1] : null;
+
+        if (next && current.type === next.type && !current.isVirus && !next.isVirus) {
+          matchLen++;
+        } else {
+          if (matchLen >= 3) {
+            const group = [];
+            for (let i = 0; i < matchLen; i++) {
+              const colIdx = c - i;
+              matchedTiles.add(`${r}_${colIdx}`);
+              group.push({ r, c: colIdx });
+            }
+            matchGroups.push({ dir: 'h', tiles: group, length: matchLen });
+          }
+          matchLen = 1;
+        }
+      }
+    }
+
+    // Vertical check
+    for (let c = 0; c < this.cols; c++) {
+      let matchLen = 1;
+      for (let r = 0; r < this.rows; r++) {
+        const current = this.grid[r][c];
+        const next = r < this.rows - 1 ? this.grid[r + 1][c] : null;
+
+        if (next && current.type === next.type && !current.isVirus && !next.isVirus) {
+          matchLen++;
+        } else {
+          if (matchLen >= 3) {
+            const group = [];
+            for (let i = 0; i < matchLen; i++) {
+              const rowIdx = r - i;
+              matchedTiles.add(`${rowIdx}_${c}`);
+              group.push({ r: rowIdx, c });
+            }
+            matchGroups.push({ dir: 'v', tiles: group, length: matchLen });
+          }
+          matchLen = 1;
+        }
+      }
+    }
+
+    return { matchedCoords: Array.from(matchedTiles).map(str => {
+      const [r, c] = str.split('_').map(Number);
+      return { r, c };
+    }), groups: matchGroups, length: matchedTiles.size };
+  }
+
+  // Process Matches, Special item creations, and Cascades
+  async processMatches(matchData) {
+    const { matchedCoords, groups } = matchData;
+    if (!matchedCoords || matchedCoords.length === 0) return;
+
+    soundManager.playMatch(this.combo);
+
+    // Determine special tile creations
+    let spawnSpecial = null;
+    let spawnCoord = null;
+
+    groups.forEach(g => {
+      if (g.length >= 5) {
+        spawnSpecial = 'gpu_laser';
+        spawnCoord = g.tiles[Math.floor(g.tiles.length / 2)];
+      } else if (g.length === 4 && !spawnSpecial) {
+        spawnSpecial = g.dir === 'h' ? 'cpu_burst_h' : 'cpu_burst_v';
+        spawnCoord = g.tiles[Math.floor(g.tiles.length / 2)];
+      }
+    });
+
+    // Check for L/T shape match -> Fan Bomb
+    if (groups.length >= 2 && !spawnSpecial) {
+      spawnSpecial = 'fan_bomb';
+      spawnCoord = groups[0].tiles[0];
+    }
+
+    // Add Score & Collect Component counts
+    const basePoints = matchedCoords.length * 100 * this.combo;
+    const perks = pcBuilder.getActivePerks();
+    const finalPoints = Math.round(basePoints * perks.scoreMultiplier);
+
+    let comboLabel = this.combo > 1 ? `COMBO x${this.combo}!` : "";
+    if (spawnSpecial === 'gpu_laser') comboLabel = "GPU LASER CREATED!";
+    if (spawnSpecial === 'cpu_burst_h' || spawnSpecial === 'cpu_burst_v') comboLabel = "CPU BURST CREATED!";
+    if (spawnSpecial === 'fan_bomb') comboLabel = "RGB FAN BOMB!";
+
+    this.addScore(finalPoints, comboLabel);
+
+    // Track targets & Virus boss damage
+    matchedCoords.forEach(({ r, c }) => {
+      const tile = this.grid[r][c];
+      if (tile && this.collectedTargets.hasOwnProperty(tile.type)) {
+        this.collectedTargets[tile.type]++;
+      }
+      // Check adjacent virus tiles to cleanse
+      this.cleanseAdjacentVirus(r, c);
+    });
+
+    if (this.currentLevel.type === 'boss') {
+      const bossDmg = matchedCoords.length * 8 * this.combo;
+      this.bossHp = Math.max(0, this.bossHp - bossDmg);
+      soundManager.playBossHit();
+      this.spawnBossDamageFX(bossDmg);
+    }
+
+    // Trigger special effects of matched tiles that are already specials
+    const extraCoordsToDestroy = [];
+    matchedCoords.forEach(({ r, c }) => {
+      const tile = this.grid[r][c];
+      if (tile && tile.special) {
+        if (tile.special === 'cpu_burst_h') {
+          soundManager.playCpuBurst();
+          for (let col = 0; col < this.cols; col++) extraCoordsToDestroy.push({ r, c: col });
+        } else if (tile.special === 'cpu_burst_v') {
+          soundManager.playCpuBurst();
+          for (let row = 0; row < this.rows; row++) extraCoordsToDestroy.push({ r: row, c });
+        } else if (tile.special === 'fan_bomb') {
+          soundManager.playNoise(0.3, 0.3);
+          for (let dr = -1; dr <= 1; dr++) {
+            for (let dc = -1; dc <= 1; dc++) {
+              const nr = r + dr, nc = c + dc;
+              if (nr >= 0 && nr < this.rows && nc >= 0 && nc < this.cols) extraCoordsToDestroy.push({ r: nr, c: nc });
+            }
+          }
+        }
+      }
+    });
+
+    // Merge coordinates
+    const allToDestroy = [...matchedCoords, ...extraCoordsToDestroy];
+
+    // Destroy tiles
+    await this.destroyTiles(allToDestroy, spawnSpecial, spawnCoord);
+
+    // Apply gravity
+    await this.applyGravity();
+
+    // Check cascading matches
+    const newMatches = this.findMatches();
+    if (newMatches.matchedCoords && newMatches.matchedCoords.length > 0) {
+      this.combo++;
+      await this.delay(180);
+      await this.processMatches(newMatches);
+    }
+  }
+
+  cleanseAdjacentVirus(r, c) {
+    const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+    dirs.forEach(([dr, dc]) => {
+      const nr = r + dr, nc = c + dc;
+      if (nr >= 0 && nr < this.rows && nc >= 0 && nc < this.cols) {
+        if (this.grid[nr][nc] && this.grid[nr][nc].isVirus) {
+          this.grid[nr][nc].isVirus = false;
+          this.spawnSparkles(nr, nc, '#00ff9d');
+        }
+      }
+    });
+  }
+
+  async destroyTiles(coords, spawnSpecial = null, spawnCoord = null) {
+    if (!coords || coords.length === 0) return;
+
+    // Visual pop & particle explosion for all destroyed candies
+    coords.forEach(({ r, c }) => {
+      const el = this.getTileEl(r, c);
+      if (el) {
+        el.classList.add('tile-popping');
+      }
+      const tile = this.grid[r][c];
+      if (tile) {
+        const comp = COMPONENT_TYPES[tile.type.toUpperCase()];
+        this.spawnSparkles(r, c, comp ? comp.color : '#ff2a85');
+      }
+    });
+
+    await this.delay(200);
+
+    // Remove from memory
+    coords.forEach(({ r, c }) => {
+      this.grid[r][c] = null;
+    });
+
+    // If 4 or 5 matched: spawn special power tile!
+    if (spawnSpecial && spawnCoord) {
+      const allowed = this.currentLevel.allowedComponents;
+      const randType = allowed[Math.floor(Math.random() * allowed.length)];
+      this.grid[spawnCoord.r][spawnCoord.c] = {
+        type: randType,
+        special: spawnSpecial,
+        isVirus: false,
+        id: `tile_${spawnCoord.r}_${spawnCoord.c}_special_${Math.random()}`
+      };
+    }
+  }
+
+  // Smooth Candy Fall-Down Animation and Top Generation
+  async applyGravity() {
+    const allowed = this.currentLevel.allowedComponents;
+    const newSpawnCoords = [];
+
+    // 1. Calculate and animate falling for each existing candy
+    for (let c = 0; c < this.cols; c++) {
+      let emptyCount = 0;
+      for (let r = this.rows - 1; r >= 0; r--) {
+        if (this.grid[r][c] === null) {
+          emptyCount++;
+        } else if (emptyCount > 0) {
+          // Animate the candy falling down emptyCount spaces
+          const el = this.getTileEl(r, c);
+          if (el) {
+            const stepY = (el.offsetHeight || 50) + 6;
+            el.style.transition = 'transform 0.22s cubic-bezier(0.5, 0, 0.75, 0)';
+            el.style.transform = `translateY(${emptyCount * stepY}px)`;
+          }
+        }
+      }
+    }
+
+    await this.delay(230);
+
+    // 2. Shift memory grid downward
+    for (let c = 0; c < this.cols; c++) {
+      let emptyRow = this.rows - 1;
+      for (let r = this.rows - 1; r >= 0; r--) {
+        if (this.grid[r][c] !== null) {
+          if (r !== emptyRow) {
+            this.grid[emptyRow][c] = this.grid[r][c];
+            this.grid[r][c] = null;
+          }
+          emptyRow--;
+        }
+      }
+
+      // 3. Generate new candies from the top
+      for (let r = emptyRow; r >= 0; r--) {
+        const type = allowed[Math.floor(Math.random() * allowed.length)];
+        this.grid[r][c] = {
+          type,
+          special: null,
+          isVirus: false,
+          id: `tile_${r}_${c}_new_${Math.random()}`
+        };
+        newSpawnCoords.push({ r, c });
+      }
+    }
+
+    // Re-render board with spawn-in animation for new candies
+    this.renderBoard(newSpawnCoords);
+    await this.delay(200);
+  }
+
+  triggerBossAttack() {
+    const bossEl = document.getElementById('boss-avatar');
+    if (bossEl) {
+      bossEl.classList.add('boss-attack-shake');
+      setTimeout(() => bossEl.classList.remove('boss-attack-shake'), 600);
+    }
+
+    // Corrupt 1-2 random tiles
+    let corrupted = 0;
+    while (corrupted < 2) {
+      const rr = Math.floor(Math.random() * this.rows);
+      const rc = Math.floor(Math.random() * this.cols);
+      if (this.grid[rr][rc] && !this.grid[rr][rc].isVirus) {
+        this.grid[rr][rc].isVirus = true;
+        this.spawnSparkles(rr, rc, '#ff0044');
+        corrupted++;
+      }
+    }
+    this.renderBoard();
+  }
+
+  addScore(pts, label = "") {
+    this.score += pts;
+    pcBuilder.addCoins(Math.round(pts / 50));
+    this.updateUI();
+
+    if (label) {
+      this.showFloatingText(label, '#ff2a85');
+    }
+  }
+
+  checkLevelStatus() {
+    const lvl = this.currentLevel;
+    let isWin = false;
+
+    if (lvl.type === 'score' && this.score >= lvl.targetScore) {
+      isWin = true;
+    } else if (lvl.type === 'collect') {
+      const allMet = Object.keys(lvl.targets).every(k => (this.collectedTargets[k] || 0) >= lvl.targets[k]);
+      if (allMet) isWin = true;
+    } else if (lvl.type === 'virus_clear') {
+      let remainingVirus = 0;
+      for (let r = 0; r < this.rows; r++) {
+        for (let c = 0; c < this.cols; c++) {
+          if (this.grid[r][c] && this.grid[r][c].isVirus) remainingVirus++;
+        }
+      }
+      if (remainingVirus === 0) isWin = true;
+    } else if (lvl.type === 'boss' && this.bossHp <= 0) {
+      isWin = true;
+    }
+
+    if (isWin) {
+      let starCount = 1;
+      if (this.score >= lvl.stars[1]) starCount = 2;
+      if (this.score >= lvl.stars[2]) starCount = 3;
+
+      this.saveHighestLevel(lvl.id + 1);
+      this.saveLevelStars(lvl.id, starCount);
+      soundManager.playWin();
+      this.showModal('win', starCount);
+    } else if (this.movesLeft <= 0) {
+      soundManager.playLose();
+      this.showModal('fail');
+    }
+  }
+
+  updateUI() {
+    const scoreVal = document.getElementById('score-val');
+    const movesVal = document.getElementById('moves-val');
+    const coinsVal = document.getElementById('coins-val');
+    const bossHpBar = document.getElementById('boss-hp-fill');
+    const bossHpText = document.getElementById('boss-hp-text');
+
+    if (scoreVal) scoreVal.innerText = this.score.toLocaleString();
+    if (movesVal) movesVal.innerText = this.movesLeft;
+    if (coinsVal) coinsVal.innerText = pcBuilder.coins.toLocaleString();
+
+    if (this.currentLevel && this.currentLevel.type === 'boss') {
+      const pct = Math.max(0, Math.min(100, Math.round((this.bossHp / this.maxBossHp) * 100)));
+      if (bossHpBar) bossHpBar.style.width = `${pct}%`;
+      if (bossHpText) bossHpText.innerText = `${this.bossHp} / ${this.maxBossHp} HP`;
+    }
+
+    // Update level objectives display
+    const objEl = document.getElementById('level-objectives');
+    if (objEl && this.currentLevel) {
+      const lvl = this.currentLevel;
+      if (lvl.type === 'score') {
+        objEl.innerHTML = `🎯 Target Score: <b>${lvl.targetScore.toLocaleString()}</b>`;
+      } else if (lvl.type === 'collect') {
+        const partsHtml = Object.keys(lvl.targets).map(k => {
+          const count = this.collectedTargets[k] || 0;
+          const req = lvl.targets[k];
+          const comp = COMPONENT_TYPES[k.toUpperCase()];
+          return `<span>${comp ? comp.name : k}: <b>${count}/${req}</b></span>`;
+        }).join(" | ");
+        objEl.innerHTML = `📦 Collect Parts: ${partsHtml}`;
+      } else if (lvl.type === 'virus_clear') {
+        let remainingVirus = 0;
+        for (let r = 0; r < this.rows; r++) {
+          for (let c = 0; c < this.cols; c++) {
+            if (this.grid[r][c] && this.grid[r][c].isVirus) remainingVirus++;
+          }
+        }
+        objEl.innerHTML = `🦠 Cleanse Virus Tiles: <b>${remainingVirus} Remaining</b>`;
+      } else if (lvl.type === 'boss') {
+        objEl.innerHTML = `👾 Boss Battle: Defeat <b>${lvl.bossName}</b>!`;
+      }
+    }
+  }
+
+  showModal(type, stars = 0) {
+    const modalEl = document.getElementById('game-modal');
+    const modalTitle = document.getElementById('modal-title');
+    const modalBody = document.getElementById('modal-body');
+
+    if (!modalEl) return;
+
+    if (type === 'win') {
+      const starIcons = '⭐'.repeat(stars) + '☆'.repeat(3 - stars);
+      modalTitle.innerText = "🎉 LEVEL COMPLETED!";
+      modalTitle.style.color = "#00ff9d";
+      modalBody.innerHTML = `
+        <div style="font-size: 36px; margin: 15px 0;">${starIcons}</div>
+        <p>Score: <b>${this.score.toLocaleString()}</b></p>
+        <p>Earned Tech Coins: <b>+🪙${Math.round(this.score / 50)}</b></p>
+        <p style="color: #ff80bb; margin-top: 15px;">New parts and levels unlocked!</p>
+        <button class="btn btn-primary" onclick="window.gameApp.nextLevel()">NEXT LEVEL 🚀</button>
+        <button class="btn btn-secondary" onclick="window.gameApp.showLevelMap()">LEVEL MAP 🗺️</button>
+      `;
+    } else {
+      modalTitle.innerText = "💥 OUT OF MOVES!";
+      modalTitle.style.color = "#ff0055";
+      modalBody.innerHTML = `
+        <p>You ran out of moves before reaching the level target.</p>
+        <p style="color: #00f0ff; margin-top: 10px;">Tip: Check the PC Workshop to install component upgrades that give extra moves and boosters!</p>
+        <button class="btn btn-primary" onclick="window.gameApp.retryLevel()">RETRY 🔄</button>
+        <button class="btn btn-secondary" onclick="window.gameApp.showLevelMap()">LEVEL MAP 🗺️</button>
+      `;
+    }
+
+    modalEl.classList.remove('hidden');
+  }
+
+  hideModal() {
+    const modalEl = document.getElementById('game-modal');
+    if (modalEl) modalEl.classList.add('hidden');
+  }
+
+  // Particle System & Visual Effects
+  spawnSparkles(r, c, color = '#ff2a85') {
+    if (!this.boardEl) return;
+    const tileWidth = this.boardEl.clientWidth / this.cols;
+    const tileHeight = this.boardEl.clientHeight / this.rows;
+    const centerX = c * tileWidth + tileWidth / 2;
+    const centerY = r * tileHeight + tileHeight / 2;
+
+    for (let i = 0; i < 12; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = Math.random() * 4 + 2;
+      this.particles.push({
+        x: centerX,
+        y: centerY,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        radius: Math.random() * 4 + 2,
+        color,
+        alpha: 1,
+        life: 1
+      });
+    }
+  }
+
+  spawnLaserBeamFX(r1, c1, r2, c2) {
+    if (!this.boardEl) return;
+    const tileWidth = this.boardEl.clientWidth / this.cols;
+    const tileHeight = this.boardEl.clientHeight / this.rows;
+
+    for (let i = 0; i < 40; i++) {
+      this.particles.push({
+        x: Math.random() * this.boardEl.clientWidth,
+        y: Math.random() * this.boardEl.clientHeight,
+        vx: (Math.random() - 0.5) * 8,
+        vy: (Math.random() - 0.5) * 8,
+        radius: Math.random() * 6 + 3,
+        color: ['#ff2a85', '#00f0ff', '#bd00ff', '#00ff9d', '#ffea00'][Math.floor(Math.random() * 5)],
+        alpha: 1,
+        life: 1.5
+      });
+    }
+  }
+
+  spawnBossDamageFX(dmg) {
+    this.showFloatingText(`-${dmg} HP!`, '#ff0055');
+  }
+
+  showFloatingText(text, color = '#ff2a85') {
+    const pop = document.createElement('div');
+    pop.className = 'floating-combo-pop';
+    pop.innerText = text;
+    pop.style.color = color;
+    document.body.appendChild(pop);
+    setTimeout(() => pop.remove(), 1200);
+  }
+
+  renderLoop() {
+    if (this.ctx && this.canvas) {
+      this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+
+      for (let i = this.particles.length - 1; i >= 0; i--) {
+        const p = this.particles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.alpha -= 0.03;
+
+        if (p.alpha <= 0) {
+          this.particles.splice(i, 1);
+          continue;
+        }
+
+        this.ctx.save();
+        this.ctx.globalAlpha = p.alpha;
+        this.ctx.fillStyle = p.color;
+        this.ctx.beginPath();
+        this.ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        this.ctx.fill();
+        this.ctx.restore();
+      }
+    }
+    requestAnimationFrame(this.renderLoop);
+  }
+
+  delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}

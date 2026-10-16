@@ -1,0 +1,18 @@
+{
+  "name": "pink-planet-tech-crush",
+  "version": "1.0.0",
+  "description": "Cyber-Pink Match-3 Web Game",
+  "main": "index.html",
+  "scripts": {
+    "start": "npx serve ."
+  },
+  "keywords": [
+    "match-3",
+    "puzzle",
+    "cyberpunk",
+    "game",
+    "javascript"
+  ],
+  "author": "",
+  "license": "MIT"
+}
